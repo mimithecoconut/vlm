@@ -152,7 +152,59 @@ def extract_kart_objects(
         - is_center_kart: Boolean indicating if this is the kart closest to image center
     """
 
-    raise NotImplementedError("Not implemented")
+    with open(info_path, "r") as f:
+        info = json.load(f)
+
+    dets_per_view = info["detections"]
+    kart_names = info["karts"]
+
+    if view_index >= len(dets_per_view):
+        return []
+
+    dets = dets_per_view[view_index]
+
+    scale_x = img_width / ORIGINAL_WIDTH
+    scale_y = img_height / ORIGINAL_HEIGHT
+
+    karts = []
+
+    for det in dets:
+        class_id, track_id, x1, y1, x2, y2 = det
+
+        if class_id != 1:  # only kart detections
+            continue
+
+        # Scale bounding box
+        xs1 = x1 * scale_x
+        ys1 = y1 * scale_y
+        xs2 = x2 * scale_x
+        ys2 = y2 * scale_y
+
+        if (xs2 - xs1) < min_box_size or (ys2 - ys1) < min_box_size:
+            continue
+
+        cx = (xs1 + xs2) / 2
+        cy = (ys1 + ys2) / 2
+
+        # Convert track_id → actual kart name
+        # track_id indexes into info["karts"]
+        kart_name = kart_names[int(track_id)]
+
+        karts.append({
+            "instance_id": int(track_id),
+            "kart_name": kart_name,
+            "center": (cx, cy),
+            "is_center_kart": False
+        })
+
+    # Identify ego car (closest to center of resized image)
+    if karts:
+        img_cx = img_width / 2
+        img_cy = img_height / 2
+        ego = min(karts, key=lambda k: (k["center"][0] - img_cx)**2 + (k["center"][1] - img_cy)**2)
+        ego["is_center_kart"] = True
+
+    return karts
 
 
 def extract_track_info(info_path: str) -> str:
@@ -166,7 +218,10 @@ def extract_track_info(info_path: str) -> str:
         Track name as a string
     """
 
-    raise NotImplementedError("Not implemented")
+    with open(info_path, "r") as f:
+        info = json.load(f)
+
+    return info.get("track", "unknown track")
 
 
 def generate_qa_pairs(info_path: str, view_index: int, img_width: int = 150, img_height: int = 100) -> list:
@@ -202,7 +257,109 @@ def generate_qa_pairs(info_path: str, view_index: int, img_width: int = 150, img
     # How many karts are in front of the ego car?
     # How many karts are behind the ego car?
 
-    raise NotImplementedError("Not implemented")
+    qa = []
+
+    karts = extract_kart_objects(info_path, view_index, img_width, img_height)
+    if not karts:
+        return []
+
+    ego = [k for k in karts if k["is_center_kart"]][0]
+    ego_cx, ego_cy = ego["center"]
+
+    track_name = extract_track_info(info_path)
+
+    # -------------------------------------------------------
+    # (1) Ego kart question
+    # -------------------------------------------------------
+    qa.append({
+        "question": "Which kart is the ego car?",
+        "answer": ego["kart_name"]
+    })
+
+    # -------------------------------------------------------
+    # (2) Total kart count
+    # -------------------------------------------------------
+    qa.append({
+        "question": "How many karts are in the scene?",
+        "answer": str(len(karts))
+    })
+
+    # -------------------------------------------------------
+    # (3) Track name
+    # -------------------------------------------------------
+    qa.append({
+        "question": "What track is this?",
+        "answer": track_name
+    })
+
+    # -------------------------------------------------------
+    # (4) For each other kart: left/right/front/behind
+    # -------------------------------------------------------
+    left_count = 0
+    right_count = 0
+    front_count = 0
+    behind_count = 0
+
+    for k in karts:
+        if k["is_center_kart"]:
+            continue
+
+        name = k["kart_name"]
+        cx, cy = k["center"]
+
+        # left vs right
+        lr = "left" if cx < ego_cx else "right"
+        if lr == "left":
+            left_count += 1
+        else:
+            right_count += 1
+
+        # front vs behind (smaller y = more in front)
+        fb = "in front of" if cy < ego_cy else "behind"
+        if fb == "in front of":
+            front_count += 1
+        else:
+            behind_count += 1
+
+        # Q1: left or right?
+        qa.append({
+            "question": f"Is {name} to the left or right of the ego car?",
+            "answer": lr
+        })
+
+        # Q2: in front or behind?
+        qa.append({
+            "question": f"Is {name} in front of or behind the ego car?",
+            "answer": "in front" if fb == "in front of" else "behind"
+        })
+
+        # Q3: combined relation
+        qa.append({
+            "question": f"Where is {name} relative to the ego car?",
+            "answer": f"{lr} and {fb}"
+        })
+
+    # -------------------------------------------------------
+    # (5) Counting questions
+    # -------------------------------------------------------
+    qa.append({
+        "question": "How many karts are to the left of the ego car?",
+        "answer": str(left_count)
+    })
+    qa.append({
+        "question": "How many karts are to the right of the ego car?",
+        "answer": str(right_count)
+    })
+    qa.append({
+        "question": "How many karts are in front of the ego car?",
+        "answer": str(front_count)
+    })
+    qa.append({
+        "question": "How many karts are behind the ego car?",
+        "answer": str(behind_count)
+    })
+
+    return qa
 
 
 def check_qa_pairs(info_file: str, view_index: int):
@@ -247,9 +404,51 @@ Usage Example: Visualize QA pairs for a specific file and view:
 You probably need to add additional commands to Fire below.
 """
 
+def build_training_qa_file(info_dir: str = "data/train", output_name: str = "train_qa_pairs1.json"):
+    """
+    Generate QA pairs for all frames in a directory and save them to a JSON file.
+    
+    Args:
+        info_dir: Directory containing *_info.json files
+        output_name: Output JSON filename (saved inside info_dir)
+    """
+    info_dir = Path(info_dir)
+    out_path = info_dir / output_name
+    
+    all_pairs = []
+    info_files = sorted(info_dir.glob("*_info.json"))
+
+    print(f"Found {len(info_files)} info files. Generating QA pairs...")
+
+    for info_file in info_files:
+        base = info_file.stem.replace("_info", "")  # e.g. 00000
+        # there are 4 views: 00, 01, 02, 03
+        for view_index in range(4):
+            # Check if the image exists
+            img = list(info_file.parent.glob(f"{base}_{view_index:02d}_im.jpg"))
+            if len(img) == 0:
+                # no image for this view → skip safely
+                continue
+            
+            try:
+                qa = generate_qa_pairs(str(info_file), view_index)
+                for q in qa:
+                    # add image filename reference
+                    q["image_file"] = f"train/{base}_{view_index:02d}_im.jpg"
+                    all_pairs.append(q)
+            except Exception as e:
+                print(f"Error generating QA for {info_file} view {view_index}: {e}")
+
+    print(f"Generated {len(all_pairs)} QA pairs. Saving to {out_path}...")
+    
+    with open(out_path, "w") as f:
+        json.dump(all_pairs, f, indent=2)
+
+    print("Done!")
+
 
 def main():
-    fire.Fire({"check": check_qa_pairs})
+    fire.Fire({"check": check_qa_pairs,  "build": build_training_qa_file,  })
 
 
 if __name__ == "__main__":
