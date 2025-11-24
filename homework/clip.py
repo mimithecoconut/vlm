@@ -102,7 +102,15 @@ class CLIP(nn.Module):
         self.vision_encoder = vision_encoder
         self.text_encoder = text_encoder
         # TODO: implement the rest components
-        raise NotImplementedError("Not implemented")
+        # Projection heads
+        vision_hidden = vision_encoder.config.hidden_size
+        text_hidden = text_encoder.config.hidden_size
+
+        self.image_proj = nn.Linear(vision_hidden, proj_dim, bias=False)
+        self.text_proj = nn.Linear(text_hidden, proj_dim, bias=False)
+
+        # Learnable temperature
+        self.logit_scale = nn.Parameter(torch.log(torch.tensor(1/temperature)))
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
         return self.vision_encoder(image)
@@ -180,7 +188,28 @@ class CLIP(nn.Module):
         Returns:
             TODO: think about the what values should be returned
         """
-        raise NotImplementedError("Not implemented")
+        # ----- Vision -----
+        vision_out = self.vision_encoder(pixel_values)
+        vision_embeds = vision_out["last_hidden_state"].mean(dim=1)
+
+        # ----- Text -----
+        text_out = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        text_embeds = text_out["last_hidden_state"].mean(dim=1)
+
+        # ----- Projection -----
+        image_features = self.image_proj(vision_embeds)
+        text_features = self.text_proj(text_embeds)
+
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        logit_scale = self.logit_scale.exp().clamp(max=100)
+        logits = logit_scale * image_features @ text_features.t()
+
+        return image_features, text_features, logits
 
 
 def compute_clip_loss(
@@ -199,7 +228,17 @@ def compute_clip_loss(
     Returns:
         The loss for the CLIP model.
     """
-    raise NotImplementedError("Not implemented")
+    image_features, text_features, logits = outputs
+    batch_size = logits.shape[0]
+
+    # Labels: each image matches its corresponding text
+    target = torch.arange(batch_size, device=logits.device)
+
+    # Cross entropy for image→text and text→image
+    loss_i2t = nn.functional.cross_entropy(logits, target)
+    loss_t2i = nn.functional.cross_entropy(logits.t(), target)
+
+    return (loss_i2t + loss_t2i) / 2
 
 
 def get_target_modules_for_lora(model: nn.Module) -> list[str]:
@@ -219,11 +258,11 @@ def get_target_modules_for_lora(model: nn.Module) -> list[str]:
 def train(
     data_dir: Path | None = None,
     output_dir: str = "clip",
-    num_train_epochs: float = 0.05,  # for debugging purpose, increase this once the dry run works
-    per_device_train_batch_size: int = 1024,
+    num_train_epochs: float = 2,  # for debugging purpose, increase this once the dry run works
+    per_device_train_batch_size: int = 64,
     gradient_accumulation_steps: int = 1,
-    learning_rate: float = 5e-4,
-    num_workers: int = 16,
+    learning_rate: float = 1e-4,
+    num_workers: int = 8,
 ):
     vlm = BaseVLM()
 
